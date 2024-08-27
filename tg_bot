@@ -1,0 +1,518 @@
+import logging
+import sqlite3
+import os
+import asyncio
+from telegram import Update
+from telegram.ext import CallbackContext, ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import BadRequest
+import aiosqlite
+from datetime import datetime, timedelta
+import aiohttp
+import re
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("logfile.log"),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Замените 'YOUR_TOKEN' на ваш токен
+TOKEN = '7229848396:AAE7TwbnEQ_ECKXdHxiNhRkRhJQM3z8nFPs'
+CHANNEL_USERNAME = '@OwnerShopchik'  # Укажите имя вашего канала
+
+DB_PATH = os.path.join(os.path.dirname(__file__), 'referral_bot.db')
+ACCOUNTS_FILE_PATH = os.path.join(os.path.dirname(__file__), 'don.txt')
+BAN_FILE_PATH = os.path.join(os.path.dirname(__file__), 'ban.txt')
+
+# Множество для хранения заблокированных пользователей
+user_command_times = {}
+user_blocked_until = {}
+waiting_queue = {}
+banned_users = set()
+
+# Создание подключения к базе данных
+
+
+def db_setup():
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+    cursor.execute(
+        '''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT,
+            referral_code TEXT UNIQUE,
+            referred_by TEXT,
+            account_given INTEGER DEFAULT 0
+        )'''
+    )
+    cursor.execute(
+        '''CREATE TABLE IF NOT EXISTS freedon (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            user_message TEXT,
+            bot_response TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )'''
+    )
+    cursor.execute(
+        '''CREATE TABLE IF NOT EXISTS promo_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            promo_code TEXT,
+            used_by INTEGER,
+            FOREIGN KEY(used_by) REFERENCES users(id)
+        )'''
+    )
+    cursor.execute(
+        '''CREATE TABLE IF NOT EXISTS user_bot_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            user_message TEXT,
+            bot_message TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )'''
+
+    )
+    connection.commit()
+    return connection
+
+# Загрузка заблокированных пользователей
+def load_banned_users():
+    global banned_users
+    if os.path.exists(BAN_FILE_PATH):
+        with open(BAN_FILE_PATH, 'r', encoding='utf-8') as file:
+            for line in file:
+                parts = line.strip().split(' ')
+                if len(parts) >= 3:
+                    user_id = parts[1].strip(':')
+                    username = parts[2].strip(':')
+                    banned_users.add((user_id, username))
+
+async def is_user_banned(username: str, user_id: int) -> bool:
+    try:
+        with open('ban.txt', 'r') as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('/')
+                if len(parts) != 2:
+                    continue
+                ban_id, ban_username = parts
+                if str(user_id) == ban_id and username == ban_username:
+                    return True
+    except FileNotFoundError:
+        logger.error("ban.txt file not found.")
+        return False
+
+async def send_message(context, chat_id, text):
+    await context.bot.send_message(chat_id, text)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or str(user_id)
+
+    if await is_user_banned(username, user_id):
+        await context.bot.send_message(chat_id=user_id, text='Вы заблокированы! Купите разбан у тех-админа за 50рублей: @идинахуйхуесос, тебе нет прощения')
+        return
+
+    # Добавляем пользователя в базу данных, если он не был добавлен
+    connection = context.bot_data['connection']
+    cursor = connection.cursor()
+    cursor.execute('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)', (user_id, username))
+    connection.commit()
+
+    response = 'Привет! Подпишитесь на канал https://t.me/OwnerShopchik и обязательно поставьте реакции на посты. Далее используйте команду /donat, чтобы проверить подписку. По поводу ошибок пишите сюда - https://t.me/fix_bag_bot'
+    await send_message(context, user_id, response)
+    log_message_to_db(cursor, user_id, username, '/start', response)
+
+async def donat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username
+    if await is_user_banned(username, user_id):
+        await send_message(context, user_id,
+                           'Вы заблокированы! Купите разбан у тех-админа за 50 рублей: @идинахуйхуесос, тебе нет прощения')
+        return
+
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        if member.status in ['member', 'administrator', 'creator']:
+            response = 'Вы подписаны на канал! Используйте команду /referral_link для получения вашего промокода. \n Также вы можете ввести промокод друга и он получит за вас 1 аккаунт. Введите промокод с помощью команды /prom (промокод)'
+        else:
+            response = 'Вы не подписаны на канал. Пожалуйста, подпишитесь и попробуйте снова.'
+        await send_message(context, user_id, response)
+        # Логируем сообщение пользователя и ответ бота
+        log_message_to_db(context.bot_data['connection'].cursor(), user_id, username, '/donat', response)
+    except BadRequest:
+        await send_message(context, user_id, 'Не удалось проверить подписку.')
+
+def log_freedon_response(cursor, user_id, username, user_message, bot_response):
+    """Записывает информацию о запросе пользователя и ответе бота в таблицу freedon"""
+    try:
+        cursor.execute('INSERT INTO freedon (user_id, username, user_message, bot_response) VALUES (?, ?, ?, ?)',
+                       (user_id, username, user_message, bot_response))
+        cursor.connection.commit()  # Не забываем коммитить изменения
+        logger.info(f'Записано сообщение для пользователя {username} (ID: {user_id}): "{user_message}" | Бот ответил: "{bot_response}"')
+    except Exception as e:
+        logger.error(f'Ошибка при логировании ответа в таблицу freedon: {e}')
+
+async def fetch_accounts(url):
+    """Загрузка списка аккаунтов с указанного URL."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.text()
+
+
+async def free_don(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or 'unknown'
+
+    logger.info(f"Пользователь {username} (ID: {user_id}) запрашивает /free_don.")
+
+    # Проверяем, заблокирован ли пользователь
+    if await is_user_banned(username, user_id):
+        await send_message(context, user_id,
+                           'Вы заблокированы! Купите разбан у тех-админа за 50 рублей: @идинахуйхуесос, вам нет прощения')
+        return
+
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+
+        if member.status not in ['member', 'administrator', 'creator']:
+            await send_message(context, user_id,
+                               'Вы не подписаны на канал. Пожалуйста, подпишитесь и попробуйте снова.')
+            logger.info(f"Пользователь {username} (ID: {user_id}) не подписан на канал.")
+            return
+
+        connection = context.bot_data['connection']
+        cursor = connection.cursor()
+
+        # Проверяем, сколько аккаунтов было выдано пользователю
+        cursor.execute('SELECT account_given FROM users WHERE id = ?', (user_id,))
+        result = cursor.fetchone()
+
+        if result and result[0] >= 1:
+            response = 'Вы уже получили аккаунт. Пригласите своих друзей в канал для получения других бесплатных аккаунтов!'
+            await send_message(context, user_id, response)
+            logger.info(f"Пользователь {username} (ID: {user_id}) уже получил аккаунт.")
+            return
+
+        # URL для загрузки аккаунтов
+        accounts_url = 'https://raw.githubusercontent.com/SRAKENS/tg_bot_donat/main/don.txt'
+        accounts_text = await fetch_accounts(accounts_url)
+
+        # Разбиваем файл на строки
+        accounts_lines = accounts_text.strip().splitlines()
+
+        # Находим первый доступный аккаунт
+        for line in accounts_lines:
+            if line.startswith("/") and line.count("/") == 1:  # Убедимся, что это правильная строка
+                # Очищаем строку от символов / и пробелов
+                account_data = line.replace("/", "").strip()
+                if account_data:  # Убедимся, что строка не пустая
+                    # Проверяем, был ли этот аккаунт выдан ранее
+                    cursor.execute('SELECT COUNT(*) FROM freedon WHERE bot_response = ?', (account_data,))
+                    account_used = cursor.fetchone()[0]
+
+                    if account_used == 0:  # Если аккаунт не использован
+                        # Логируем использованный аккаунт в базе данных
+                        cursor.execute(
+                            'INSERT INTO freedon (user_id, username, user_message, bot_response) VALUES (?, ?, ?, ?)',
+                            (user_id, username, update.message.text, account_data))
+                        connection.commit()
+
+                        # Отправляем пользователю аккаунт
+                        await send_message(context, user_id,
+                                           f'Ваш аккаунт: {account_data}')  # Форматируем ответ для пользователя
+
+                        # Обновляем количество выданных аккаунтов
+                        cursor.execute('UPDATE users SET account_given = account_given + 1 WHERE id = ?', (user_id,))
+                        connection.commit()
+                        logger.info(f"Пользователь {username} (ID: {user_id}) получил аккаунт: {account_data}")
+                        break
+        else:
+            await send_message(context, user_id,
+                               'Все доступные аккаунты были выданы. Напишите тех админу - @SRAKENOS, он поможет вам, когда будет свободен!')
+
+    except Exception as e:
+        logger.error(f'Ошибка в команде /free_don для пользователя {username} (ID: {user_id}): {e}')
+        await send_message(context, user_id, 'Произошла ошибка. Попробуйте позже.')
+
+
+
+async def referral_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    referral_code = str(user_id)
+
+    # Получить реферальный код из аргументов команды, если он есть
+    referred_code = context.args[0] if context.args else None
+
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        if member.status not in ['member', 'administrator', 'creator']:
+            await send_message(context, user_id,
+                               'Вы не подписаны на канал. Пожалуйста, подпишитесь и попробуйте снова.')
+            return
+
+        # Сохранение промокода в базе данных
+        connection = context.bot_data['connection']
+        cursor = connection.cursor()
+
+        # Сначала сохранить самого пользователя
+        cursor.execute('INSERT OR IGNORE INTO users (id, username, referral_code, referred_by) VALUES (?, ?, ?, ?)',
+                       (user_id, update.message.from_user.username, referral_code, referred_code))
+
+        # Если пользователь был приглашен по реферальному коду, обновляем информацию
+        if referred_code:
+            cursor.execute('UPDATE users SET referred_by = ? WHERE referral_code = ?',
+                           (referred_code, referred_code))
+
+        connection.commit()
+
+        # Проверка записи
+        cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+        user_record = cursor.fetchone()
+        print("Записанная информация:", user_record)
+
+        response = (f'Ваш промокод: {referral_code}. Используйте его, чтобы пригласить своих друзей! n Инструкция как правильно использовать промокод: \n 1) Передайте свой промокод тому кому хотели \n 2) Скажите чтобы ваш друг ввел команду /prom {referral_code} \n 3) После того как ваш друг введет промокод, ему напишет что Промокод успешно активирован и вашему реферу доступен бесплатный аккаунт. \n 4) Если вы убедились, что ваш друг успешно активировал промокод, пропишите команду: /free_don \n 5) Все!!!')
+        await send_message(context, user_id, response)
+
+        # Логируем сообщение пользователя и ответ бота
+        log_message_to_db(cursor, user_id, update.message.from_user.username, '/referral_link', response)
+
+    except BadRequest:
+        await send_message(context, user_id, 'Не удалось проверить подписку.')
+    finally:
+        return
+
+def log_message_to_db(cursor, user_id, username, user_message, bot_message):
+    try:
+        cursor.execute('INSERT INTO user_bot_messages (user_id, username, user_message, bot_message) VALUES (?, ?, ?, ?)',
+                       (user_id, username, user_message, bot_message))
+        cursor.connection.commit()  # Не забываем коммитить изменения
+        logger.info(f'Пользователь {username} написал сообщение: "{user_message}". Бот ответил: "{bot_message}".')
+    except Exception as e:
+        logger.error(f'Ошибка при логировании сообщений: {e}')
+
+async def promo_limit_check(promo_code: str, user_id: int, cursor) -> bool:
+    # Проверка, использовался ли промокод 2 раза
+    cursor.execute('SELECT COUNT(*) FROM promo_usage WHERE promo_code = ?', (promo_code,))
+    count = cursor.fetchone()[0]
+    return count < 2
+
+async def prom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    promo_code = context.args[0] if context.args else None
+
+    # Проверка, заблокирован ли пользователь
+    if await is_user_banned(update.message.from_user.username, user_id):
+        await send_message(context, user_id, 'Вы заблокированы! Купите разбан у тех-админа за 50 рублей: @идинахуйхуесос, вам нет прощения')
+        return
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        if member.status not in ['member', 'administrator', 'creator']:
+            await send_message(context, user_id,
+                               'Вы не подписаны на канал. Пожалуйста, подпишитесь и попробуйте снова.')
+            return
+
+
+        # Проверка, ввел ли пользователь промокод
+        if not promo_code:
+            response = 'Пожалуйста, введите промокод после команды /prom. \n Пример: (/prom 123456789)'
+            await send_message(context, user_id, response)
+            # Логируем сообщение пользователя и ответ бота
+            log_message_to_db(context.bot_data['connection'].cursor(), user_id, username, '/prom', response)
+            return
+
+        connection = context.bot_data['connection']
+        cursor = connection.cursor()
+
+        # Проверка, использовался ли промокод ранее пользователем
+        cursor.execute('SELECT COUNT(*) FROM promo_usage WHERE promo_code = ? AND used_by = ?', (promo_code, user_id))
+        user_usage_count = cursor.fetchone()[0]
+
+        if user_usage_count > 0:
+            response = 'Вы уже использовали этот промокод.'
+            await send_message(context, user_id, response)
+            # Логируем сообщение пользователя и ответ бота
+            log_message_to_db(cursor, user_id, username, f'/prom {promo_code}', response)
+            return
+
+        # Проверка на использование собственного промокода
+        if str(user_id) == promo_code:
+            response =  'Вы не можете использовать свой собственный промокод. При повторных нарушениях вы будете ЗАБЛОКИРОВАНЫ БЕЗ ВОЗМОЖНОСТИ РАЗБАНА!!.'
+            await send_message(context, user_id, response)
+            # Логируем сообщение пользователя и ответ бота
+            log_message_to_db(cursor, user_id, username, f'/prom {promo_code}', response)
+            return
+
+        # Проверка существования пользователя с указанным ID (проверка промокода)
+        cursor.execute('SELECT referral_code FROM users WHERE id = ?', (promo_code,))
+        referrer = cursor.fetchone()
+
+        if referrer is None:
+            response = 'Неверный промокод, проверьте правильно ли вы его ввели.'
+            await send_message(context, user_id, response)
+            # Логируем сообщение пользователя и ответ бота
+            log_message_to_db(cursor, user_id, username, f'/prom {promo_code}', response)
+            return
+
+        # Удаление пользователя из базы
+        cursor.execute('DELETE FROM users WHERE id = ?', (promo_code,))
+        connection.commit()
+
+        # Проверка, использовался ли промокод 2 раза
+        if not await promo_limit_check(promo_code, user_id, cursor):
+            response = 'Промокод уже выгорел и его больше нельзя использовать. Напишите тех-админу бота - @SRAKENOS, он поможет вам, когда будет свободен!'
+            await send_message(context, user_id, response)
+            # Логируем сообщение пользователя и ответ бота
+            log_message_to_db(cursor, user_id, username, f'/prom {promo_code}', response)
+            return
+
+        # Сохранение использования промокода
+        cursor.execute('INSERT INTO promo_usage (promo_code, used_by) VALUES (?, ?)', (promo_code, user_id))
+        connection.commit()
+
+        # Отправка единственного сообщения об успехе
+        response = 'Ваш промокод активирован! Вы можете получить бонус командой /bonus.\n Шансы на высокий донат увеличены!\nВыполните условия и получайте халявный донат!!! Либо приглашайте рефералов по своему промокоду командой: /referral_link, и получайте за это аккаунты.'
+        await send_message(context, user_id, response)
+        # Логируем сообщение пользователя и ответ бота
+        log_message_to_db(cursor, user_id, username, f'/prom {promo_code}', response)
+    except BadRequest:
+        await send_message(context, user_id, 'Не удалось проверить подписку.')
+
+async def bonus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or str(user_id)
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        if member.status not in ['member', 'administrator', 'creator']:
+            await send_message(context, user_id,
+                               'Вы не подписаны на канал. Пожалуйста, подпишитесь и попробуйте снова.')
+            return
+
+        if await is_user_banned(username, user_id):
+            await context.bot.send_message(chat_id=user_id, text='Вы заблокированы! Купите разбан у тех-админа за 50рублей: @идинахуйхуесос, тебе нет прощения')
+            return
+
+        # Добавляем пользователя в базу данных, если он не был добавлен
+        connection = context.bot_data['connection']
+        cursor = connection.cursor()
+        cursor.execute('INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)', (user_id, username))
+        connection.commit()
+
+        message = "Ваши шансы на выпадение высокого доната увеличены:\nвип: 50% »»» 10%\nадмин: 40% »»» 5%\nмодер: 20% »»» 5%\nэнигма: 10% »»» 50%\nхелпер: 9% »»» 20%\nблэйз: 2% »»» 10%\nантигрифер: 0,001% »»» 1%\nУдачи, вы так же можете получить аккаунт, дав ссылку на бота другу --- https://t.me/MineBlaze_free_bot , и сказать ему ввести ваш промокод: \n /prom (промокод), далее когда он введет ваш промокод вы должны повторно прописать команду /free_don и вам сразу выдаст еще один аккаунт \n C Любовью команда --- RipTimes"
+        await context.bot.send_message(chat_id=user_id, text=message)
+    except BadRequest:
+        await send_message(context, user_id, 'Не удалось проверить подписку.')
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_name = update.message.from_user.username or 'unknown'  # Получаем имя пользователя или 'unknown'
+    user_id = update.message.from_user.id  # Получаем ID пользователя
+    user_text = update.message.text  # Получаем текст сообщения
+
+    # Проверяем, заблокирован ли пользователь
+    if await is_user_banned(user_name, user_id):
+        return  # Игнорируем сообщения от заблокированного пользователя
+
+    current_time = datetime.now()  # Получаем текущее время
+
+    # Инициализируем список временных меток для пользователей
+    if user_id not in user_command_times:
+        user_command_times[user_id] = []
+
+    # Удаляем временные метки старше одной секунды
+    user_command_times[user_id] = [timestamp for timestamp in user_command_times[user_id] if
+                                   (current_time - timestamp).total_seconds() < 1]
+
+    # Добавляем текущее время
+    user_command_times[user_id].append(current_time)
+
+    # Проверяем, отправлял ли пользователь сообщения слишком быстро
+    if len(user_command_times[user_id]) > 1:
+        # Блокируем пользователя и сохраняем информацию о блокировке
+        ban_user(user_id, user_name, 180)  # Блокируем на 3 минуты
+        await send_message(context, user_id, 'Вы слишком часто отправляете сообщения и были временно заблокированы.')
+        return
+
+    # Логируем сообщение пользователя
+    logger.info(f'Пользователь с ID {user_id} отправил сообщение: {user_text}')
+
+    # Записываем сообщение пользователя в базу данных
+    connection = context.bot_data['connection']
+    if connection is None:
+        logger.error("Соединение с базой данных не установлено.")
+        return
+
+    cursor = connection.cursor()
+    try:
+        # Логируем сообщение пользователя в базе данных
+        log_message_to_db(cursor, user_id, user_name, user_text, "")  # Пустой ответ от бота
+
+        # Формируем ответ бота
+        response_message = f'Ну и нахуя ты написал: "{user_text}" \n Доступные команды: \n 1) /start - ссылка на канал \n 2) /donat - проверить подписку на канал \n 3) /referral_link - выдает твой промик \n 4) /prom - Вы можете ввести промокод друга, за который вы получите БОНУС, а ваш друг возможность получить еще 1 аккаунт! \n 5) /free_don - получить аккаунт с донатом, за выполнение условий акции!!'
+        await send_message(context, user_id, response_message)  # Отправляем ответ пользователю
+
+        # Обновляем лог с сообщением от бота в базе данных
+        cursor.execute('UPDATE user_bot_messages SET bot_message = ? WHERE user_id = ? AND user_message = ?',
+                       (response_message, user_id, user_text))
+
+        connection.commit()  # Подтверждаем изменения в базе данных
+
+    except Exception as e:
+        logger.error(f'Ошибка при записи сообщения в БД: {e}')
+def ban_user(user_id, user_name, duration):
+    """
+    Функция для блокировки пользователя на указанное время.
+    """
+    with open(BAN_FILE_PATH, 'a', encoding='utf-8') as ban_file:
+        ban_file.write(f'{user_id}/{user_name}n')  # Записываем пользователя в ban.txt
+    asyncio.create_task(remove_user_from_ban(user_id, user_name, duration))
+
+async def remove_user_from_ban(user_id, user_name, duration):
+    await asyncio.sleep(duration)  # Ждем указанное количество секунд
+    # Прочитаем текущий файл забаненных пользователей
+    if os.path.exists(BAN_FILE_PATH):
+        with open(BAN_FILE_PATH, 'r', encoding='utf-8') as ban_file:
+            banned_users = ban_file.readlines()
+
+        # Фильтруем список, исключая заблокированного пользователя
+        with open(BAN_FILE_PATH, 'w', encoding='utf-8') as ban_file:
+            for line in banned_users:
+                if line.strip() != f'{user_id}/{user_name}':  # Убираем из списка
+                    ban_file.write(line)  # Записываем оставшихся забаненных обратно в файл
+
+
+
+def main() -> None:
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # Настройка базы данных
+    connection = db_setup()
+    app.bot_data['connection'] = connection
+
+    # Загрузка заблокированных пользователей
+    load_banned_users()
+
+    # Обработчики команд
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("donat", donat))
+    app.add_handler(CommandHandler("free_don", free_don))
+    app.add_handler(CommandHandler("bonus", bonus))
+    app.add_handler(CommandHandler("referral_link", referral_link))
+    app.add_handler(CommandHandler("prom", prom))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Запускаем бота
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
